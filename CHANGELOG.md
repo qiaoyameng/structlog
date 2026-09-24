@@ -15,6 +15,11 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.processors.RedactFields`: a processor that replaces values at configured key paths (exact keys, dotted keys as single segments, and a `*` wildcard for all mapping values / sequence elements) with a fixed placeholder.
+  It rebuilds nested `dict` / `list` / `tuple` containers without mutating the caller's data, replaces circular references with a cycle marker, and bounds traversal with *max_depth* / *max_nodes* limits that substitute unchecked subtrees with a truncation marker.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

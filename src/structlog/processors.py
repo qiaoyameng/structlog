@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from types import FrameType, TracebackType
 from typing import (
     Any,
@@ -56,6 +56,7 @@ __all__ = [
     "JSONRenderer",
     "KeyValueRenderer",
     "LogfmtRenderer",
+    "RedactFields",
     "StackInfoRenderer",
     "TimeStamper",
     "UnicodeDecoder",
@@ -1003,3 +1004,187 @@ class EventRenamer:
                 event_dict["event"] = replace_by
 
         return event_dict
+
+
+class RedactFields:
+    """
+    Replace values at configured key paths with a fixed placeholder.
+
+    The event dictionary is traversed and **rebuilt**: the returned event
+    dictionary, and every ``dict`` / ``list`` / ``tuple`` within it, are new
+    objects. The *event_dict* passed in -- and any containers it shares with
+    bound context or with other handlers of the same `logging.LogRecord` --
+    are never modified. Redacted values are dropped without ever calling
+    their ``str()`` / ``repr()``.
+
+    Only instances of the exact built-in types ``dict``, ``list``, and
+    ``tuple`` are traversed. Anything else -- including subclasses of those
+    types, sets, generators, and arbitrary objects -- is treated as an opaque
+    leaf and passed through by reference without touching its attributes or
+    iteration protocol.
+
+    Args:
+        rules:
+            An iterable of *path rules*. Each rule is a non-empty sequence of
+            path segments. A plain string segment matches a mapping key
+            exactly (a key containing dots, e.g. ``"a.b"``, is matched as one
+            segment -- segments are never split). The special segment
+            `RedactFields.WILDCARD` matches every value of a mapping or every
+            element of a sequence at that position. A value whose full path
+            matches a rule is replaced by *replacement*.
+
+        replacement:
+            The placeholder that replaces matched values. (default:
+            ``"***"``)
+
+        max_depth:
+            Maximum nesting of containers that is traversed. Deeper subtrees
+            are replaced by *truncated_marker* without being inspected.
+            (default: 10)
+
+        max_nodes:
+            Maximum number of nodes (containers and leaves) visited in one
+            call. Once the budget is exhausted, remaining subtrees are
+            replaced by *truncated_marker* without being inspected. (default:
+            1000)
+
+        cycle_marker:
+            Marker used to replace circular references. (default:
+            ``"<cycle>"``)
+
+        truncated_marker:
+            Marker used to replace subtrees that could not be checked because
+            *max_depth* or *max_nodes* was reached. (default:
+            ``"<truncated>"``)
+
+    Raises:
+        ValueError: If a rule is empty, is not a sequence of non-empty
+            strings, or if *max_depth* / *max_nodes* are not positive
+            integers.
+
+    .. note::
+
+       No per-object caching is used while walking, so the same sub-object
+       reachable through multiple paths is checked independently against the
+       rules that apply at each path.
+
+    .. versionadded:: 26.2.0
+    """
+
+    WILDCARD: ClassVar[str] = "*"
+
+    def __init__(
+        self,
+        rules: Iterable[Sequence[str]] = (),
+        replacement: Any = "***",
+        max_depth: int = 10,
+        max_nodes: int = 1000,
+        cycle_marker: str = "<cycle>",
+        truncated_marker: str = "<truncated>",
+    ) -> None:
+        self._rules = self._validate_rules(rules)
+        self._replacement = replacement
+        self._max_depth = self._validate_limit("max_depth", max_depth)
+        self._max_nodes = self._validate_limit("max_nodes", max_nodes)
+        self._cycle_marker = cycle_marker
+        self._truncated_marker = truncated_marker
+
+    @staticmethod
+    def _validate_rules(
+        rules: Iterable[Sequence[str]],
+    ) -> tuple[tuple[str, ...], ...]:
+        normalized = []
+        for rule in rules:
+            if isinstance(rule, str) or not isinstance(rule, Sequence):
+                raise ValueError(
+                    "Each rule must be a non-string sequence of path "
+                    f"segments, e.g. ('a', 'b'); got {rule!r}."
+                )
+            if not rule:
+                raise ValueError("Rules must not be empty.")
+            for segment in rule:
+                if not isinstance(segment, str) or not segment:
+                    raise ValueError(
+                        "Path segments must be non-empty strings; got "
+                        f"{segment!r} in rule {rule!r}."
+                    )
+            normalized.append(tuple(rule))
+
+        return tuple(normalized)
+
+    @staticmethod
+    def _validate_limit(name: str, value: int) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(
+                f"{name} must be a positive integer; got {value!r}."
+            )
+
+        return value
+
+    def __call__(
+        self, logger: WrappedLogger, method_name: str, event_dict: EventDict
+    ) -> EventDict:
+        return cast(
+            EventDict,
+            self._walk(event_dict, self._rules, 1, set(), [self._max_nodes]),
+        )
+
+    def _walk(
+        self,
+        value: Any,
+        rules: tuple[tuple[str, ...], ...],
+        depth: int,
+        path_ids: set[int],
+        budget: list[int],
+    ) -> Any:
+        # A rule that has been fully consumed matches this value.
+        if () in rules:
+            return self._replacement
+
+        budget[0] -= 1
+        if budget[0] < 0:
+            return self._truncated_marker
+
+        value_type = type(value)
+        if value_type not in (dict, list, tuple):
+            # Opaque leaf (includes subclasses of dict/list/tuple): passed
+            # through by reference without touching it.
+            return value
+
+        if depth > self._max_depth:
+            return self._truncated_marker
+
+        value_id = id(value)
+        if value_id in path_ids:
+            return self._cycle_marker
+
+        path_ids = path_ids | {value_id}
+        child_depth = depth + 1
+
+        def walk_child(key: Any, child: Any) -> Any:
+            child_rules = tuple(
+                rule[1:]
+                for rule in rules
+                if rule
+                and (
+                    rule[0] == self.WILDCARD
+                    or (type(key) is str and rule[0] == key)
+                )
+            )
+
+            return self._walk(
+                child, child_rules, child_depth, path_ids, budget
+            )
+
+        if value_type is dict:
+            return {
+                key: walk_child(key, child) for key, child in value.items()
+            }
+        if value_type is list:
+            return [
+                walk_child(index, child) for index, child in enumerate(value)
+            ]
+
+        return tuple(
+            walk_child(index, child) for index, child in enumerate(value)
+        )
