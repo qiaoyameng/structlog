@@ -229,6 +229,10 @@ API Reference
 
 .. autoclass:: EventRenamer
 
+.. autoclass:: RedactFields
+
+   .. autoattribute:: ANY
+
 .. autofunction:: add_log_level
 
 .. autoclass:: UnicodeDecoder

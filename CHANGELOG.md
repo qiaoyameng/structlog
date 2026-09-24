@@ -15,6 +15,11 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.processors.RedactFields`: a composable processor that replaces values at configured path-based rules (exact keys, `RedactFields.ANY` wildcards for mapping values and sequence elements) with a fixed placeholder.
+  It traverses only built-in `dict`/`list`/`tuple` containers without mutating the originals, marks cyclic references, and bounds traversal by depth and node count (unchecked subtrees are replaced by a truncation marker).
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

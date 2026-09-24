@@ -56,6 +56,7 @@ __all__ = [
     "JSONRenderer",
     "KeyValueRenderer",
     "LogfmtRenderer",
+    "RedactFields",
     "StackInfoRenderer",
     "TimeStamper",
     "UnicodeDecoder",
@@ -1003,3 +1004,201 @@ class EventRenamer:
                 event_dict["event"] = replace_by
 
         return event_dict
+
+
+class _RedactTrieNode:
+    """
+    One node of the compiled redaction rule trie.
+    """
+
+    __slots__ = ("exact", "terminal", "wildcard")
+
+    def __init__(self) -> None:
+        self.exact: dict[str, _RedactTrieNode] = {}
+        self.wildcard: _RedactTrieNode | None = None
+        self.terminal = False
+
+
+class RedactFields:
+    r"""
+    Replace values at configured paths with a fixed placeholder.
+
+    Rules are given as iterables of *path segments*.  A plain string segment
+    matches a mapping key exactly -- notably, keys containing dots are **not**
+    split, so ``("a.b",)`` matches the single key ``"a.b"``.  The special
+    segment `RedactFields.ANY` matches all values of the current mapping or
+    all elements of the current sequence.
+
+    Only built-in `dict`, `list`, and `tuple` instances are traversed; any
+    other object (including subclasses of those types, and arbitrary objects
+    with attributes or iteration protocols) is left untouched and is never
+    inspected.  Redacted values are replaced without calling ``str()`` or
+    ``repr()`` on them.
+
+    The event dict is never modified in place: a new structure of built-in
+    containers is returned, so bound context, the original event values, and
+    data shared with other handlers of the same `logging.LogRecord` (e.g. via
+    `structlog.stdlib.ProcessorFormatter`) stay intact.  Shared sub-objects
+    are re-examined on every path they appear on, so different rules may
+    apply to the same object reached through different paths.  Cyclic
+    references are replaced by *cycle_marker*.
+
+    Traversal is bounded by *max_depth* and *max_nodes*.  A subtree that
+    cannot be checked because a limit is reached is replaced by
+    *truncation_marker* -- unchecked original objects are never passed on to
+    the renderer.
+
+    Args:
+        rules:
+            An iterable of rules, where each rule is a non-empty iterable of
+            path segments (strings or `RedactFields.ANY`).  The default of no
+            rules redacts nothing.
+
+        placeholder: The value redacted fields are replaced with.
+
+        max_depth:
+            Maximum nesting depth of containers that is traversed.  Deeper
+            containers are replaced by *truncation_marker*.
+
+        max_nodes:
+            Maximum number of container nodes that are traversed per event.
+            Containers beyond the budget are replaced by *truncation_marker*.
+
+        cycle_marker: The value cyclic references are replaced with.
+
+        truncation_marker:
+            The value subtrees beyond *max_depth* / *max_nodes* are replaced
+            with.
+
+    .. versionadded:: 26.2.0
+    """
+
+    ANY: Final = "*"
+
+    def __init__(
+        self,
+        rules: Collection[Sequence[str]] = (),
+        *,
+        placeholder: str = "***",
+        max_depth: int = 20,
+        max_nodes: int = 1_000,
+        cycle_marker: str = "<cycle>",
+        truncation_marker: str = "<truncated>",
+    ):
+        if not isinstance(max_depth, int) or max_depth < 1:
+            msg = f"max_depth must be a positive integer, got {max_depth!r}."
+            raise ValueError(msg)
+        if not isinstance(max_nodes, int) or max_nodes < 1:
+            msg = f"max_nodes must be a positive integer, got {max_nodes!r}."
+            raise ValueError(msg)
+        for marker_name, marker in (
+            ("placeholder", placeholder),
+            ("cycle_marker", cycle_marker),
+            ("truncation_marker", truncation_marker),
+        ):
+            if not isinstance(marker, str):
+                msg = f"{marker_name} must be a string, got {marker!r}."
+                raise TypeError(msg)
+
+        root = _RedactTrieNode()
+        has_rules = False
+        for rule in rules:
+            segments = tuple(rule)
+            if not segments:
+                msg = "Redaction rules must not be empty."
+                raise ValueError(msg)
+            node = root
+            for segment in segments:
+                if not isinstance(segment, str) or not segment:
+                    msg = (
+                        "Path segments must be non-empty strings, "
+                        f"got {segment!r}."
+                    )
+                    raise TypeError(msg)
+                if segment == self.ANY:
+                    if node.wildcard is None:
+                        node.wildcard = _RedactTrieNode()
+                    node = node.wildcard
+                else:
+                    node = node.exact.setdefault(segment, _RedactTrieNode())
+            node.terminal = True
+            has_rules = True
+
+        self._root = root
+        self._has_rules = has_rules
+        self.placeholder = placeholder
+        self.max_depth = max_depth
+        self.max_nodes = max_nodes
+        self.cycle_marker = cycle_marker
+        self.truncation_marker = truncation_marker
+
+    def __call__(
+        self, logger: logging.Logger, name: str, event_dict: EventDict
+    ) -> EventDict:
+        if not self._has_rules:
+            return event_dict
+
+        return cast(
+            "EventDict",
+            self._walk(event_dict, (self._root,), 0, [self.max_nodes], ()),
+        )
+
+    def _walk(
+        self,
+        value: Any,
+        nodes: tuple[_RedactTrieNode, ...],
+        depth: int,
+        budget: list[int],
+        ancestors: tuple[int, ...],
+    ) -> Any:
+        value_type = type(value)
+        if value_type not in (dict, list, tuple):
+            return value
+
+        if depth >= self.max_depth or budget[0] <= 0:
+            return self.truncation_marker
+        budget[0] -= 1
+
+        value_id = id(value)
+        if value_id in ancestors:
+            return self.cycle_marker
+        ancestors = (*ancestors, value_id)
+
+        wildcard_nodes = tuple(
+            node.wildcard for node in nodes if node.wildcard is not None
+        )
+
+        if value_type is dict:
+            return {
+                key: self._child(
+                    child,
+                    wildcard_nodes
+                    + tuple(
+                        node.exact[key] for node in nodes if key in node.exact
+                    ),
+                    depth,
+                    budget,
+                    ancestors,
+                )
+                for key, child in value.items()
+            }
+
+        children = [
+            self._child(child, wildcard_nodes, depth, budget, ancestors)
+            for child in value
+        ]
+
+        return children if value_type is list else tuple(children)
+
+    def _child(
+        self,
+        value: Any,
+        nodes: tuple[_RedactTrieNode, ...],
+        depth: int,
+        budget: list[int],
+        ancestors: tuple[int, ...],
+    ) -> Any:
+        if any(node.terminal for node in nodes):
+            return self.placeholder
+
+        return self._walk(value, nodes, depth + 1, budget, ancestors)
