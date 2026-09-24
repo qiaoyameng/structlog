@@ -17,6 +17,7 @@ from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from typing import Any, NamedTuple, NoReturn
 
+from ._base import _LOCAL_LOG_CAPTURE
 from ._config import configure, get_config
 from ._log_levels import map_method_name
 from .exceptions import DropEvent
@@ -63,24 +64,96 @@ class LogCapture:
         raise DropEvent
 
 
+class _LocalLogCapture:
+    """
+    State of one local `capture_logs` context.
+
+    Carried by a context variable, so it is visible to the current execution
+    context and any asyncio tasks created within it, but not to other
+    threads or to tasks that were created outside of it.
+
+    Once the owning context manager exits, ``active`` is set to `False` and
+    execution contexts that still reference this object (for example,
+    asyncio tasks that outlive the context manager) fall back to their
+    regular processor chain.
+
+    .. versionadded:: 26.2.0
+    """
+
+    __slots__ = ("active", "processors")
+
+    processors: list[Processor]
+    active: bool
+
+    def __init__(self, processors: list[Processor]) -> None:
+        self.processors = processors
+        self.active = True
+
+
 @contextmanager
 def capture_logs(
     processors: Iterable[Processor] = (),
+    *,
+    local: bool = False,
 ) -> Generator[list[EventDict], None, None]:
     """
     Context manager that appends all logging statements to its yielded list
     while it is active. Disables all configured processors for the duration
     of the context manager.
 
-    Attention: this is **not** thread-safe!
+    By default, this works by replacing the global processor chain, which
+    affects the whole process.  Pass ``local=True`` to capture only log
+    events from the current execution context instead, without touching the
+    global configuration.
 
     Args:
         processors: Processors to apply before the logs are captured.
 
+        local:
+            If `True`, capture only events that are logged in the current
+            execution context (and asyncio tasks created within it) and
+            leave the global configuration untouched.
+
+            In local mode:
+
+            - The global processor chain is never modified, so it is safe
+              to use in concurrently running tests.  Loggers from other
+              threads, or from asyncio tasks that existed before the block,
+              keep using the regular configuration.
+            - Bound loggers that were created and cached before entering
+              the block are captured too, because the capture is looked up
+              when the event is processed, not when the logger is built.
+            - Asyncio tasks created within the block inherit the capture.
+              Once the block exits, tasks that are still running stop
+              capturing and resume regular logging; they never append to
+              the already-returned list.
+            - Captures can be nested; only the innermost active capture
+              collects an event.
+
     .. versionadded:: 20.1.0
     .. versionadded:: 25.5.0 *processors* parameter
+    .. versionadded:: 26.2.0 *local* parameter
+
+    .. attention::
+       The default (``local=False``) mode is **not** thread-safe!
     """
     cap = LogCapture()
+
+    if local:
+        capture = _LocalLogCapture([*processors, cap])
+        token = _LOCAL_LOG_CAPTURE.set(capture)
+        try:
+            yield cap.entries
+        finally:
+            # Deactivate before resetting, so execution contexts that still
+            # carry this capture (e.g. asyncio tasks that outlive the block)
+            # resume regular logging instead of appending to the returned
+            # list.
+            capture.active = False
+            _LOCAL_LOG_CAPTURE.reset(token)
+
+        return
+
     # Modify `_Configuration.default_processors` set via `configure` but always
     # keep the list instance intact to not break references held by bound
     # loggers.

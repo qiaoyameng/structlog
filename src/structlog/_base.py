@@ -9,6 +9,7 @@ Logger wrapper and helper class.
 
 from __future__ import annotations
 
+import contextvars
 import sys
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -23,6 +24,19 @@ if sys.version_info >= (3, 11):
     from typing import Self
 else:
     from typing_extensions import Self
+
+
+_LOCAL_LOG_CAPTURE: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "structlog_local_log_capture", default=None
+)
+"""
+The currently active local log capture, if any.
+
+Set by `structlog.testing.capture_logs` in local mode.  The value is an
+opaque object with an ``active`` attribute and a ``processors`` attribute.
+Because it is a context variable, it is inherited by asyncio tasks created
+while it is set, but not by threads.
+"""
 
 
 class BoundLoggerBase:
@@ -162,6 +176,10 @@ class BoundLoggerBase:
             Allow final processor to return `bytes`.
         .. versionchanged:: 21.2.0
             Allow final processor to return a `bytearray`.
+        .. versionchanged:: 26.2.0
+            If a local log capture is active in the current execution
+            context (see `structlog.testing.capture_logs`), its processors
+            are used instead of the bound logger's own.
         """
         # We're typing it as Any, because processors can return more than an
         # EventDict.
@@ -170,7 +188,14 @@ class BoundLoggerBase:
 
         if event is not None:
             event_dict["event"] = event
-        for proc in self._processors:
+
+        capture = _LOCAL_LOG_CAPTURE.get()
+        if capture is not None and capture.active:
+            processors = capture.processors
+        else:
+            processors = self._processors
+
+        for proc in processors:
             event_dict = proc(self._logger, method_name, event_dict)
 
         if isinstance(event_dict, (str, bytes, bytearray)):

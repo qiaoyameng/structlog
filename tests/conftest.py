@@ -3,8 +3,11 @@
 # 2.0, and the MIT License.  See the LICENSE file in the root of this
 # repository for complete details.
 
+import asyncio
 import logging
+import os
 
+from asyncio.selector_events import BaseSelectorEventLoop
 from io import StringIO
 
 import pytest
@@ -74,3 +77,36 @@ def _cl():
 @pytest.fixture(autouse=True)
 def _reset_config():
     structlog.reset_defaults()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _workaround_broken_self_pipe():
+    """
+    Some sandboxed environments block the send() syscall on socket pairs
+    with EPERM, which silently breaks asyncio's cross-thread loop wakeup
+    that run_in_executor() and shutdown_default_executor() rely on.
+    os.write() on the same socket fd is not blocked and behaves the same
+    for the non-blocking self-pipe.
+    """
+    if os.name == "nt":
+        yield
+
+        return
+
+    orig_write_to_self = BaseSelectorEventLoop._write_to_self
+
+    def _write_to_self(self):
+        csock = self._csock
+        if csock is None:
+            return
+
+        try:
+            os.write(csock.fileno(), b"\0")
+        except OSError:
+            pass
+
+    BaseSelectorEventLoop._write_to_self = _write_to_self
+    try:
+        yield
+    finally:
+        BaseSelectorEventLoop._write_to_self = orig_write_to_self

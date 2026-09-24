@@ -15,6 +15,13 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.testing.capture_logs` now supports a *local* mode (`local=True`) that captures log events using a context variable instead of replacing the global processor chain.
+  In local mode, the global configuration is never touched, so concurrently running tests, threads, and asyncio tasks that were created outside of the capture block keep logging to the regular sink.
+  Asyncio tasks created within the block inherit the capture, but stop capturing (and resume regular logging) once the block exits -- even if they outlive it.
+  Since the capture is resolved when an event is processed, it also works with bound loggers that were created and cached before entering the block.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

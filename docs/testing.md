@@ -33,6 +33,26 @@ For example, to capture {doc}`contextvars`:
 If you have *cache_logger_on_first_use* enabled for {doc}`performance <performance>`, any cached loggers will not be affected, so it’s recommended you do not enable it during tests.
 :::
 
+If you run tests concurrently (for example, using *pytest-xdist* with threaded event loops, or `asyncio` tests that run in parallel tasks), changing the global configuration is not an option.
+In that case, use the *local* mode that captures only events from the current execution context and leaves the global configuration untouched:
+
+```{doctest}
+>>> from structlog import get_logger
+>>> from structlog.testing import capture_logs
+>>> with capture_logs(local=True) as cap_logs:
+...    get_logger().bind(x="y").info("hello")
+>>> cap_logs
+[{'x': 'y', 'event': 'hello', 'log_level': 'info'}]
+```
+
+In local mode:
+
+- The global processor chain is never modified, so loggers from other threads, or from asyncio tasks that existed before the block, keep using the regular configuration.
+- Bound loggers that were created and cached before entering the block are captured too, because the capture is looked up when the event is processed, not when the logger is built.
+- Asyncio tasks created within the block inherit the capture.
+  Once the block exits, tasks that are still running stop capturing and resume regular logging; they never append to the already-returned list.
+- Captures can be nested; only the innermost active capture collects an event.
+
 You can build your own helpers using {class}`structlog.testing.LogCapture`.
 For example a [*pytest*](https://docs.pytest.org/) fixture to capture log output could look like this:
 
