@@ -17,6 +17,7 @@ from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from typing import Any, NamedTuple, NoReturn
 
+from ._capture import _ACTIVE_CAPTURE, CaptureState
 from ._config import configure, get_config
 from ._log_levels import map_method_name
 from .exceptions import DropEvent
@@ -66,21 +67,61 @@ class LogCapture:
 @contextmanager
 def capture_logs(
     processors: Iterable[Processor] = (),
+    *,
+    local: bool = False,
 ) -> Generator[list[EventDict], None, None]:
     """
     Context manager that appends all logging statements to its yielded list
     while it is active. Disables all configured processors for the duration
     of the context manager.
 
-    Attention: this is **not** thread-safe!
+    Attention: by default, this is **not** thread-safe! Pass *local* as True
+    for a context-local capture that doesn't touch the global configuration.
 
     Args:
         processors: Processors to apply before the logs are captured.
 
+        local:
+            If True, don't modify the global configuration. Instead, only
+            capture logs that are emitted from the current execution context
+            (as defined by `contextvars`): the current code, and `asyncio`
+            tasks that are created while the context manager is active.
+
+            Other threads, and asyncio tasks that already exist when the
+            context manager is entered, keep logging through the configured
+            processor chain and are not captured. Likewise, once the context
+            manager exits, tasks that outlive it resume logging through the
+            configured chain and no longer append to the yielded list.
+
+            Captures can be nested: only the innermost active capture collects
+            events, and the outer capture resumes once the inner one exits.
+
+            Unlike the default mode, this also works with bound loggers that
+            have been created (and cached) before entering the context
+            manager, because the capture is checked when the event is
+            processed, not when the logger is built.
+
     .. versionadded:: 20.1.0
     .. versionadded:: 25.5.0 *processors* parameter
+    .. versionadded:: 26.2.0 *local* parameter
     """
     cap = LogCapture()
+    if local:
+        # Carry the capture in a context variable that is checked when an
+        # event is processed. The global configuration is never touched.
+        state = CaptureState(processors=(*processors, cap))
+        token = _ACTIVE_CAPTURE.set(state)
+        try:
+            yield cap.entries
+        finally:
+            # Deactivate first, so execution contexts that still reference
+            # this state (e.g. asyncio tasks created within the block that
+            # finish after it) fall back to the regular processor chain
+            # instead of appending to the yielded list.
+            state.active = False
+            _ACTIVE_CAPTURE.reset(token)
+        return
+
     # Modify `_Configuration.default_processors` set via `configure` but always
     # keep the list instance intact to not break references held by bound
     # loggers.

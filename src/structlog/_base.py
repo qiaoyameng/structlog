@@ -16,6 +16,7 @@ from typing import Any
 
 from structlog.exceptions import DropEvent
 
+from ._capture import _ACTIVE_CAPTURE
 from .typing import BindableLogger, Context, Processor, WrappedLogger
 
 
@@ -162,6 +163,10 @@ class BoundLoggerBase:
             Allow final processor to return `bytes`.
         .. versionchanged:: 21.2.0
             Allow final processor to return a `bytearray`.
+        .. versionchanged:: 26.2.0
+            If a local capture from `structlog.testing.capture_logs` is active
+            in the current execution context, its processor chain is used
+            instead of the configured one.
         """
         # We're typing it as Any, because processors can return more than an
         # EventDict.
@@ -170,7 +175,14 @@ class BoundLoggerBase:
 
         if event is not None:
             event_dict["event"] = event
-        for proc in self._processors:
+
+        capture = _ACTIVE_CAPTURE.get()
+        if capture is not None and capture.active:
+            processors: Iterable[Processor] = capture.processors
+        else:
+            processors = self._processors
+
+        for proc in processors:
             event_dict = proc(self._logger, method_name, event_dict)
 
         if isinstance(event_dict, (str, bytes, bytearray)):
