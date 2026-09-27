@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
 import functools
 import logging
+import logging.handlers
+import pickle
 import sys
 import threading
+import traceback
 import warnings
 
 from collections.abc import Callable, Collection, Iterable, Sequence
@@ -40,7 +44,7 @@ from .contextvars import (
     merge_contextvars,
 )
 from .exceptions import DropEvent
-from .processors import StackInfoRenderer
+from .processors import StackInfoRenderer, _figure_out_exc_info
 from .typing import (
     Context,
     EventDict,
@@ -57,6 +61,7 @@ __all__ = [
     "LoggerFactory",
     "PositionalArgumentsFormatter",
     "ProcessorFormatter",
+    "QueueHandler",
     "add_log_level",
     "add_log_level_number",
     "add_logger_name",
@@ -1256,3 +1261,123 @@ class ProcessorFormatter(logging.Formatter):
         del event_dict["_from_structlog"]
 
         return event_dict
+
+
+class QueueHandler(logging.handlers.QueueHandler):
+    r"""
+    A `logging.handlers.QueueHandler` that passes *structlog* event
+    dictionaries safely through a queue.
+
+    The standard library's `logging.handlers.QueueHandler` formats each
+    `logging.LogRecord` into a string before enqueueing it, which destroys
+    the structured event dictionary that
+    `ProcessorFormatter.wrap_for_formatter` put into ``record.msg``. This
+    handler instead enqueues a self-contained *snapshot* of the record that
+    can be rendered by `ProcessorFormatter` on the other side of the queue --
+    including a `multiprocessing.Queue` with a
+    `logging.handlers.QueueListener` living in a different process.
+
+    The following properties are captured on the **producer** side, at the
+    moment of the logging call, and travel with the record:
+
+    - The bound context and event keywords (the event dictionary).
+    - The log level and the logger name.
+    - The original call site (file name, line number, function name).
+    - The creation time of the event (``record.created``).
+
+    Snapshot semantics
+        The event dictionary is deep-copied (by means of a :mod:`pickle`
+        round-trip) synchronously, before the logging call returns. Mutating
+        the original event dictionary -- or any container nested within it --
+        after the call does **not** affect the already-enqueued event.
+
+    Exceptions
+        ``exc_info`` is resolved on the producer (using *its* current
+        exception, never the consumer's) and rendered into a plain string
+        that survives pickling:
+
+        - For *structlog* events, the rendered traceback replaces the
+          ``exc_info`` key with an ``exception`` key in the event dictionary,
+          mirroring what `structlog.processors.ExceptionRenderer` does.
+        - For foreign (`logging`) records, the traceback is rendered into
+          ``record.exc_text`` and ``record.exc_info`` is cleared, like the
+          standard library does. Set *keep_exc_info* to `True` on the
+          consumer's `ProcessorFormatter` to have it appended to the output.
+
+        The consumer never re-creates exception information from its own
+        thread state.
+
+    Data boundary
+        Everything that is picklable crosses the queue: built-in JSON-style
+        data, standard log metadata, and pre-rendered exceptions. Anything
+        else (file objects, locks, lambdas, ...) raises synchronously in the
+        **calling** thread and is passed to `logging.Handler.handleError` --
+        the standard, configurable error hook -- instead of failing silently
+        in `multiprocessing`'s feeder thread. By default, `handleError`
+        prints the error to ``sys.stderr`` if `logging.raiseExceptions` is
+        true; subclass `QueueHandler` and override
+        `~logging.Handler.handleError` for custom handling (for example,
+        metrics or a fallback logger).
+
+    Backpressure
+        Like the standard library's handler, enqueueing uses
+        ``queue.put_nowait()`` and therefore never blocks the calling thread.
+        If the queue is full, `queue.Full` is raised and routed to
+        `logging.Handler.handleError` as described above. Override
+        `~logging.handlers.QueueHandler.enqueue` if you need a different
+        policy (for example, blocking with a timeout).
+
+    The consumer side needs no special machinery: run a standard
+    `logging.handlers.QueueListener` with handlers that use
+    `ProcessorFormatter`, and stop it with
+    `logging.handlers.QueueListener.stop` as usual.
+
+    .. versionadded:: 26.2.0
+    """
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        """
+        Return a self-contained, queue-safe snapshot of *record*.
+
+        The original *record* and the event dictionary it carries are left
+        untouched for other handlers.
+        """
+        # Work on a copy so the original record is left alone for other
+        # handlers within this process.
+        record = copy.copy(record)
+
+        if isinstance(record.msg, dict):
+            # A structlog event dictionary, wrapped by
+            # ProcessorFormatter.wrap_for_formatter. Render exc_info into a
+            # string while we're still on the producing thread, because the
+            # consumer can't reconstruct our exception state.
+            ed = record.msg = dict(record.msg)
+            exc_info = _figure_out_exc_info(ed.pop("exc_info", None))
+            if exc_info is None and record.exc_info:
+                # logging.Logger.exception() also puts the resolved
+                # exception onto the record itself.
+                exc_info = record.exc_info
+            if exc_info is not None:
+                ed["exception"] = "".join(
+                    traceback.format_exception(*exc_info)
+                )
+            record.exc_info = None
+            record.exc_text = None
+        else:
+            # A foreign record from plain logging: interpolate the message
+            # arguments and render the exception eagerly, because neither
+            # args nor traceback objects can cross the queue.
+            record.msg = record.getMessage()
+            record.args = None
+            if record.exc_info:
+                record.exc_text = "".join(
+                    traceback.format_exception(*record.exc_info)
+                )
+                record.exc_info = None
+
+        # Snapshot and validate in one step: the pickle round-trip detaches
+        # the record from the caller's objects (so later mutations can't leak
+        # into the queue) and proves *now*, in the calling thread, that the
+        # record can cross the queue. Failures propagate to emit(), which
+        # routes them to handleError().
+        return pickle.loads(pickle.dumps(record))

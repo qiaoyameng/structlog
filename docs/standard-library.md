@@ -576,5 +576,61 @@ Additionally, for both `logging` and *structlog* -- but only for the colorful lo
 If you leave `foreign_pre_chain` as `None`, formatting will be left to `logging`.
 Meaning: you can define a `format` for {class}`~structlog.stdlib.ProcessorFormatter` too!
 
+## Logging through queues and across processes
+
+If you want to decouple producing log entries from rendering them -- for example, to keep I/O out of request-handling threads, or to log from multiple processes into one place -- the standard library offers {class}`logging.handlers.QueueHandler` and {class}`logging.handlers.QueueListener`.
+Unfortunately, the stock `QueueHandler` formats each record into a string before enqueueing it, which destroys *structlog*'s event dictionary.
+
+Use {class}`structlog.stdlib.QueueHandler` instead.
+It enqueues a self-contained *snapshot* of the log record that a `QueueListener` -- in the same process, or in a different one via a `multiprocessing.Queue` -- can render using {class}`~structlog.stdlib.ProcessorFormatter`:
+
+```python
+# Producer side (every process)
+import multiprocessing
+import structlog
+
+log_queue = multiprocessing.Queue()
+
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
+
+queue_handler = structlog.stdlib.QueueHandler(log_queue)
+root_logger = logging.getLogger()
+root_logger.addHandler(queue_handler)
+root_logger.setLevel(logging.INFO)
+```
+
+```python
+# Consumer side (one process)
+listener = logging.handlers.QueueListener(
+    log_queue,
+    logging.StreamHandler(),  # configured with a ProcessorFormatter
+)
+listener.start()
+...
+listener.stop()
+```
+
+The handler guarantees the following, all captured on the **producer** at the moment of the logging call:
+
+- The event dictionary (including the bound context) is deep-copied synchronously.
+  Mutating the original objects after the logging call returns does not change the enqueued event.
+- Log level, logger name, the original call site, and the creation timestamp travel with the record.
+- `exc_info` is resolved using the producer's exception state and rendered into a string (`exception` key for *structlog* events, `exc_text` for foreign `logging` records).
+  The consumer never re-creates exception information from its own thread state.
+- Anything that can't cross the queue (that is, can't be pickled: file objects, locks, lambdas, ...) fails **synchronously** in the calling thread and is routed to {meth}`logging.Handler.handleError` instead of being lost silently in `multiprocessing`'s feeder thread.
+  Override `handleError` to customize what happens then.
+- Enqueueing never blocks the calling thread: it uses `queue.put_nowait()`, and a full queue results in a `queue.Full` error that is also routed to `handleError`.
+  Override `enqueue` if you need a different backpressure policy.
+
+No additional background machinery is needed on either side: the consumer is a stock `logging.handlers.QueueListener` whose handlers use `ProcessorFormatter`, and {meth}`logging.handlers.QueueListener.stop` works as usual.
+
 
 [*python-json-logger*]: https://github.com/nhairs/python-json-logger

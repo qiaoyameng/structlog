@@ -15,6 +15,11 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.stdlib.QueueHandler`: a drop-in replacement for `logging.handlers.QueueHandler` that ships self-contained snapshots of *structlog* events through a queue (including `multiprocessing.Queue`) to a stock `logging.handlers.QueueListener` that renders them with `structlog.stdlib.ProcessorFormatter`.
+  The event dictionary is snapshotted synchronously (later mutations can't leak into the queue), exceptions are rendered on the producer, and unpicklable values or a full queue are reported synchronously through `logging.Handler.handleError` instead of being lost in `multiprocessing`'s feeder thread.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

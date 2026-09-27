@@ -328,6 +328,9 @@ API Reference
 .. autoclass:: ProcessorFormatter
    :members: wrap_for_formatter, remove_processors_meta
 
+.. autoclass:: QueueHandler
+   :members: prepare
+
 
 `structlog.tracebacks` Module
 -----------------------------
