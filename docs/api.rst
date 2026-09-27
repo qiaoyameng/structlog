@@ -341,6 +341,18 @@ API Reference
 .. autoclass:: Frame
 .. autoclass:: SyntaxError_
 
+.. data:: TRUNCATED_EXCEPTIONS_MARKER
+
+   The ``exc_type`` of the marker stack that is inserted when the *max_exceptions* budget of a conversion is exhausted.
+
+.. data:: TRUNCATED_FRAMES_MARKER
+
+   The ``name`` of the marker frame that is inserted when the *max_total_frames* budget of a conversion is exhausted.
+
+.. data:: TRUNCATED_GROUP_DEPTH_MARKER
+
+   The ``exc_type`` of the marker stack that is inserted when the *max_group_depth* budget of a conversion is exceeded.
+
 
 `structlog.typing` Module
 -------------------------

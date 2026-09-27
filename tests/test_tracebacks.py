@@ -919,6 +919,15 @@ def test_json_tracebacks_skip_sunder_dunder(
         {"max_frames": -1},
         {"max_frames": 0},
         {"max_frames": 1},
+        {"max_exceptions": -1},
+        {"max_exceptions": True},
+        {"max_exceptions": 1.5},
+        {"max_total_frames": -1},
+        {"max_total_frames": False},
+        {"max_total_frames": "3"},
+        {"max_group_depth": -1},
+        {"max_group_depth": True},
+        {"max_group_depth": 0.5},
     ],
 )
 def test_json_traceback_value_error(kwargs: dict[str, Any]) -> None:
@@ -1202,3 +1211,406 @@ def test_exception_cycle():
         )
         == trace.stacks[0]
     )
+
+
+def _zero_division() -> ZeroDivisionError:
+    try:
+        1 / 0
+    except ZeroDivisionError as e:
+        return e
+
+    pytest.fail("unreachable")  # pragma: no cover
+
+
+def _nested_group(depth: int, width: int) -> ExceptionGroup:  # noqa: F821
+    """
+    Build an ExceptionGroup nesting *depth* levels of *width*
+    ZeroDivisionErrors.
+    """
+    if depth == 0:
+        return _zero_division()
+
+    return ExceptionGroup(  # noqa: F821
+        f"level {depth}",
+        [_nested_group(depth - 1, width) for _ in range(width)],
+    )
+
+
+def _render(exc: BaseException, **kwargs: Any) -> list[dict[str, Any]]:
+    try:
+        raise exc
+    except BaseException as e:
+        return tracebacks.ExceptionDictTransformer(**kwargs)(
+            (type(e), e, e.__traceback__)
+        )
+
+
+def _count_nodes(stacks: list[dict[str, Any]]) -> int:
+    """
+    Count real (non-marker) exception nodes in a rendered exception tree.
+    """
+    count = 0
+    for stack in stacks:
+        if stack["exc_type"] in (
+            tracebacks.TRUNCATED_EXCEPTIONS_MARKER,
+            tracebacks.TRUNCATED_GROUP_DEPTH_MARKER,
+        ):
+            continue
+        count += 1
+        for sub in stack["exceptions"]:
+            count += _count_nodes(sub)
+    return count
+
+
+def _count_frames(stacks: list[dict[str, Any]]) -> int:
+    """
+    Count real (non-marker) frames in a rendered exception tree.
+    """
+    count = 0
+    for stack in stacks:
+        count += sum(1 for f in stack["frames"] if f["lineno"] != -1)
+        for sub in stack["exceptions"]:
+            count += _count_frames(sub)
+    return count
+
+
+def _marker_types(stacks: list[dict[str, Any]]) -> list[str]:
+    """
+    Collect the exc_types of all truncation markers in a rendered tree.
+    """
+    markers = []
+    for stack in stacks:
+        if stack["exc_type"].startswith("<truncated:"):
+            markers.append(stack["exc_type"])
+        for sub in stack["exceptions"]:
+            markers.extend(_marker_types(sub))
+    return markers
+
+
+class TestExceptionDictTransformerBudgets:
+    """
+    Tests for the max_exceptions / max_total_frames / max_group_depth budgets
+    of ExceptionDictTransformer.
+    """
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+    )
+    def test_no_budgets_by_default(self):
+        """
+        Without budgets, the output is complete and contains no truncation
+        markers -- also when the budgets are explicitly set to None.
+        """
+        try:
+            raise _nested_group(2, 2)
+        except Exception as e:
+            exc_info = (type(e), e, e.__traceback__)
+            default = tracebacks.ExceptionDictTransformer(
+                show_locals=False
+            )(exc_info)
+            explicit = tracebacks.ExceptionDictTransformer(
+                show_locals=False,
+                max_exceptions=None,
+                max_total_frames=None,
+                max_group_depth=None,
+            )(exc_info)
+
+        assert default == explicit
+        assert [] == _marker_types(default)
+        assert 7 == _count_nodes(default)
+
+    def test_max_exceptions_zero(self):
+        """
+        A zero exception budget yields a single truncation marker.
+        """
+        result = _render(_zero_division(), max_exceptions=0)
+
+        assert [tracebacks.TRUNCATED_EXCEPTIONS_MARKER] == [
+            s["exc_type"] for s in result
+        ]
+
+    def test_max_total_frames_zero(self):
+        """
+        A zero frame budget keeps the exception nodes but replaces all frames
+        with a marker.
+        """
+        result = _render(_zero_division(), max_total_frames=0)
+
+        assert "ZeroDivisionError" == result[0]["exc_type"]
+        assert [
+            {
+                "filename": "",
+                "lineno": -1,
+                "name": tracebacks.TRUNCATED_FRAMES_MARKER,
+            }
+        ] == result[0]["frames"]
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+    )
+    def test_max_group_depth_zero(self):
+        """
+        A zero group depth budget keeps the root group but replaces its
+        children with a marker.
+        """
+        result = _render(_nested_group(1, 2), max_group_depth=0)
+
+        assert result[0]["is_group"]
+        assert [
+            [
+                {
+                    "exc_type": tracebacks.TRUNCATED_GROUP_DEPTH_MARKER,
+                    "exc_value": "",
+                    "exc_notes": [],
+                    "syntax_error": None,
+                    "is_cause": False,
+                    "frames": [],
+                    "is_group": False,
+                    "exceptions": [],
+                }
+            ]
+        ] == result[0]["exceptions"]
+
+    def test_max_exceptions_cause_chain(self):
+        """
+        The exception budget is shared along a cause chain and kept nodes
+        retain their type, message, notes and is_cause flag.
+        """
+        try:
+            try:
+                1 / 0
+            except ArithmeticError as orig:
+                raise ValueError("onoes") from orig
+        except ValueError as e:
+            e.add_note("a note")
+            result = tracebacks.ExceptionDictTransformer(
+                show_locals=False, max_exceptions=1
+            )((type(e), e, e.__traceback__))
+
+        assert 2 == len(result)
+        assert "ValueError" == result[0]["exc_type"]
+        assert "onoes" == result[0]["exc_value"]
+        assert ["a note"] == result[0]["exc_notes"]
+        assert result[0]["is_cause"] is False
+        assert (
+            tracebacks.TRUNCATED_EXCEPTIONS_MARKER == result[1]["exc_type"]
+        )
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+    )
+    def test_max_exceptions_wide_group(self):
+        """
+        The exception budget is shared by all children of a group and
+        truncation is deterministic in the original exception order.
+        """
+        result = _render(
+            _nested_group(1, 5), show_locals=False, max_exceptions=3
+        )
+
+        assert 1 == len(result)
+        children = result[0]["exceptions"]
+        # root + 2 children consume the budget, then one marker is appended.
+        assert 3 == len(children)
+        assert [
+            "ZeroDivisionError",
+            "ZeroDivisionError",
+            tracebacks.TRUNCATED_EXCEPTIONS_MARKER,
+        ] == [c[0]["exc_type"] for c in children]
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+    )
+    def test_max_exceptions_shared_cause(self):
+        """
+        A cause that is shared by two exceptions is only extracted and counted
+        once, so repeated references don't distort the budget.
+        """
+        shared = _zero_division()
+        e1 = ValueError("a")
+        e1.__cause__ = shared
+        e2 = ValueError("b")
+        e2.__cause__ = shared
+
+        try:
+            raise ExceptionGroup("shared", [e1, e2])  # noqa: F821
+        except Exception as e:
+            exc_info = (type(e), e, e.__traceback__)
+            full = tracebacks.ExceptionDictTransformer(
+                show_locals=False, max_exceptions=4
+            )(exc_info)
+            truncated = tracebacks.ExceptionDictTransformer(
+                show_locals=False, max_exceptions=3
+            )(exc_info)
+
+        # root, e1, shared, e2: 4 unique nodes fit into the budget of 4.
+        assert [] == _marker_types(full)
+        assert 4 == _count_nodes(full)
+        assert (
+            "ZeroDivisionError"
+            == full[0]["exceptions"][0][1]["exc_type"]  # shared cause of e1
+        )
+        assert (
+            "ValueError" == full[0]["exceptions"][1][0]["exc_type"]  # e2
+        )
+
+        # With one less, e2 is truncated and a marker takes its place.
+        assert 3 == _count_nodes(truncated)
+        assert [tracebacks.TRUNCATED_EXCEPTIONS_MARKER] == _marker_types(
+            truncated
+        )
+        assert (
+            tracebacks.TRUNCATED_EXCEPTIONS_MARKER
+            == truncated[0]["exceptions"][1][0]["exc_type"]
+        )
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+    )
+    def test_max_group_depth_nested(self):
+        """
+        Groups nested deeper than max_group_depth are replaced by a marker at
+        the truncation position.
+        """
+        result = _render(
+            _nested_group(3, 1), show_locals=False, max_group_depth=1
+        )
+
+        level1 = result[0]
+        assert "ExceptionGroup" == level1["exc_type"]
+        level2 = level1["exceptions"][0][0]
+        assert "ExceptionGroup" == level2["exc_type"]
+        # The children of the level-2 group are not expanded.
+        assert [
+            tracebacks.TRUNCATED_GROUP_DEPTH_MARKER
+        ] == _marker_types(result)
+        assert (
+            tracebacks.TRUNCATED_GROUP_DEPTH_MARKER
+            == level2["exceptions"][0][0]["exc_type"]
+        )
+
+    @pytest.mark.skipif(
+        sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+    )
+    def test_combined_budgets(self):
+        """
+        All three budgets apply together to one conversion run.
+        """
+        result = _render(
+            _nested_group(3, 3),
+            show_locals=False,
+            max_exceptions=5,
+            max_total_frames=4,
+            max_group_depth=2,
+        )
+
+        assert _count_nodes(result) <= 5
+        assert _count_frames(result) <= 4
+        markers = _marker_types(result)
+        assert tracebacks.TRUNCATED_EXCEPTIONS_MARKER in markers
+        # The group is 3 levels deep, so the depth budget truncates too.
+        assert tracebacks.TRUNCATED_GROUP_DEPTH_MARKER in markers
+
+    @pytest.mark.parametrize("use_rich", [False, True])
+    def test_max_total_frames_skips_locals(self, use_rich: bool):
+        """
+        Frames beyond the frame budget are not extracted: their locals are
+        neither read nor repr()ed.
+        """
+
+        class ReprCounter:
+            calls = 0
+
+            def __repr__(self) -> str:
+                type(self).calls += 1
+                return "<counted>"
+
+        def spam() -> None:
+            counted = ReprCounter()
+            1 / 0
+
+        ctx = (
+            patch.object(tracebacks, "rich", rich)
+            if use_rich and rich is not None
+            else patch.object(tracebacks, "rich", None)
+        )
+        with ctx:
+            try:
+                spam()
+            except Exception as e:
+                # The traceback has 2 frames: this test and spam().  Only the
+                # first one fits the budget, so spam()'s local "counted" must
+                # never be repr()ed.
+                result = tracebacks.ExceptionDictTransformer(
+                    show_locals=True, max_total_frames=1, use_rich=use_rich
+                )((type(e), e, e.__traceback__))
+                calls_after_budget = ReprCounter.calls
+
+                unlimited = tracebacks.ExceptionDictTransformer(
+                    show_locals=True, use_rich=use_rich
+                )((type(e), e, e.__traceback__))
+
+        frames = result[0]["frames"]
+        assert 2 == len(frames)
+        assert {
+            "filename": "",
+            "lineno": -1,
+            "name": tracebacks.TRUNCATED_FRAMES_MARKER,
+        } == frames[-1]
+        assert 0 == calls_after_budget
+
+        # Without a budget, spam()'s frame is extracted and repr()ed once.
+        assert 1 == ReprCounter.calls
+        assert "<counted>" == unlimited[0]["frames"][1]["locals"]["counted"]
+
+    def test_max_total_frames_shared_across_chain(self):
+        """
+        The frame budget is shared by all stacks of a cause chain.
+        """
+
+        def spam() -> None:
+            1 / 0
+
+        try:
+            try:
+                spam()
+            except ArithmeticError:
+                raise ValueError("onoes")  # noqa: B904
+        except ValueError as e:
+            result = tracebacks.ExceptionDictTransformer(
+                show_locals=False, max_total_frames=2
+            )((type(e), e, e.__traceback__))
+
+        assert 2 == len(result)
+        # The ValueError stack has 1 frame and the ZeroDivisionError stack
+        # has 2 (test + spam), so the budget runs out inside the second
+        # stack: it keeps 1 real frame and gets a marker.
+        assert 2 == _count_frames(result)
+        assert 2 == len(result[1]["frames"])
+        assert {
+            "filename": "",
+            "lineno": -1,
+            "name": tracebacks.TRUNCATED_FRAMES_MARKER,
+        } == result[1]["frames"][-1]
+
+    def test_budgets_with_suppress(self):
+        """
+        Suppressed files and frame budgets work together: kept frames in
+        suppressed files have no locals, the marker frame is untouched.
+        """
+
+        def spam() -> None:
+            1 / 0
+
+        try:
+            spam()
+        except Exception as e:
+            result = tracebacks.ExceptionDictTransformer(
+                show_locals=True,
+                suppress=(__file__,),
+                max_total_frames=1,
+            )((type(e), e, e.__traceback__))
+
+        frames = result[0]["frames"]
+        assert "locals" not in frames[0]
+        assert tracebacks.TRUNCATED_FRAMES_MARKER == frames[-1]["name"]

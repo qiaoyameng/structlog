@@ -15,6 +15,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.tracebacks.ExceptionDictTransformer` now has optional *max_exceptions*, *max_total_frames*, and *max_group_depth* arguments that limit one whole conversion run across nested exception groups and cause chains.
+  When a budget is exhausted, a marker (see `structlog.tracebacks.TRUNCATED_EXCEPTIONS_MARKER`, `TRUNCATED_FRAMES_MARKER`, and `TRUNCATED_GROUP_DEPTH_MARKER`) is inserted at the truncation position.
+  Frames beyond the frame budget are not extracted at all, so their locals are neither read nor rendered.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

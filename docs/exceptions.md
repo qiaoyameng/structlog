@@ -33,6 +33,27 @@ The most common use-cases are already covered by the following processors:
 If these prove insufficient, see {ref}`Custom Filtering of Dict Tracebacks <custom-dict-tracebacks>`.
 
 
+### Limiting the Size of Dict Tracebacks
+
+Exception groups can be wide or deeply nested, and cause chains can be long, so a single exception can result in a very large `exception` key.
+In addition to *max_frames* (which limits each stack individually), {class}`~structlog.tracebacks.ExceptionDictTransformer` offers three optional budgets that apply to one whole conversion and are shared by all nested exception groups and cause chains:
+
+- *max_exceptions*: the maximum total number of exception nodes that are kept.
+- *max_total_frames*: the maximum total number of frames that are kept.
+  Frames beyond the budget are not extracted at all -- their local variables are neither read nor rendered.
+- *max_group_depth*: the maximum nesting depth of exception groups that is expanded.
+  The root exception is at depth 0.
+
+All three default to `None`, which means no limit.
+Truncation is deterministic and follows the original exception order.
+Wherever a budget cuts the output short, a marker is inserted instead:
+
+- a stack whose `exc_type` is {data}`~structlog.tracebacks.TRUNCATED_EXCEPTIONS_MARKER` for skipped exception nodes,
+- a frame whose `name` is {data}`~structlog.tracebacks.TRUNCATED_FRAMES_MARKER` for skipped frames,
+- a stack whose `exc_type` is {data}`~structlog.tracebacks.TRUNCATED_GROUP_DEPTH_MARKER` for skipped exception group levels.
+
+The nodes that are kept retain their full information (type, message, notes, `is_cause`, and their position in the tree), but the presence of a marker means the exception has *not* been recorded completely -- the `exception` key is a truncated view, not the full exception tree.
+
 ## Console rendering
 
 Our {doc}`console-output`'s {class}`structlog.dev.ConsoleRenderer` takes an *exception_formatter* argument that allows for customizing the output of exceptions.
