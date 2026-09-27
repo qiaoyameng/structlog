@@ -15,6 +15,12 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 
 ## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
 
+### Added
+
+- `structlog.tracebacks.ExceptionDictTransformer` and `structlog.tracebacks.extract()` now accept optional *max_exceptions*, *max_total_frames*, and *max_group_depth* budgets that bound one whole conversion – shared by all cause chains and nested exception groups – instead of only limiting each stack with *max_frames*.
+  The budgets are enforced during extraction (over-budget frames are never inspected), and truncation points are marked with `"truncated"` stack entries or `Skipped frames: N (max_total_frames)` marker frames.
+  The defaults keep the previous output unchanged.
+
 
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 

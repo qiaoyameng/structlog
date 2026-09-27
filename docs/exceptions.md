@@ -33,6 +33,26 @@ The most common use-cases are already covered by the following processors:
 If these prove insufficient, see {ref}`Custom Filtering of Dict Tracebacks <custom-dict-tracebacks>`.
 
 
+### Limiting the Size of Dict Tracebacks
+
+In addition to *max_frames* (which limits each stack individually), {class}`structlog.tracebacks.ExceptionDictTransformer` can bound a whole conversion – including all cause chains and nested exception groups – using three optional budgets that share one traversal:
+
+- *max_exceptions*: the maximum number of exception nodes to extract.
+- *max_total_frames*: the maximum total number of frames across all stacks.
+- *max_group_depth*: the maximum nesting depth up to which exception groups are expanded (the root exception is at depth 0).
+
+All three default to `None`, which means no limit and unchanged output.
+The budgets are enforced while extracting, so frames beyond the budget are never inspected (their locals are not read and no `repr()` is taken of them).
+
+When a budget cuts the output short, a marker is left at the truncation point so you can tell the output is incomplete:
+
+- Omitted exceptions are replaced by a stack dict with a `"truncated"` key naming the exhausted budget, for example `{"exc_type": "", "exc_value": "", ..., "truncated": "max_exceptions"}`.
+  The same structure with `"truncated": "max_group_depth"` is used for exception groups whose children were not expanded.
+- Omitted frames are replaced by a marker frame like `{"filename": "", "lineno": -1, "name": "Skipped frames: 3 (max_total_frames)"}`.
+
+Exceptions and frames that made it into the output are complete and correct – but a `"truncated"` marker anywhere in the output means the exception tree was *not* fully recorded and the output must not be treated as the full traceback.
+
+
 ## Console rendering
 
 Our {doc}`console-output`'s {class}`structlog.dev.ConsoleRenderer` takes an *exception_formatter* argument that allows for customizing the output of exceptions.

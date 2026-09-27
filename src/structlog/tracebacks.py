@@ -89,6 +89,9 @@ class Stack:
 
     .. versionchanged:: 25.4.0
        Added the *is_group* and *exceptions* fields.
+
+    .. versionchanged:: 26.2.0
+       Added the *truncated* field.
     """
 
     exc_type: str
@@ -99,6 +102,7 @@ class Stack:
     frames: list[Frame] = field(default_factory=list)
     is_group: bool = False
     exceptions: list[Trace] = field(default_factory=list)
+    truncated: str | None = None
 
 
 @dataclass
@@ -108,6 +112,42 @@ class Trace:
     """
 
     stacks: list[Stack]
+
+
+@dataclass
+class _Budget:
+    """
+    Mutable extraction budget shared by one whole extract() call tree.
+
+    A ``None`` field means "no limit".  The remaining counts are decremented
+    as exceptions and frames are extracted, so all sub-groups and cause
+    chains share the same budget instead of resetting it.
+    """
+
+    exceptions_remaining: int | None
+    frames_remaining: int | None
+    max_group_depth: int | None
+
+
+def _validate_budget(name: str, value: int | None) -> None:
+    """Ensure a budget argument is None or a non-negative int (not bool)."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f'"{name}" must be an int or None: {value!r}'
+        raise TypeError(msg)
+    if value < 0:
+        msg = f'"{name}" must be >= 0: {value}'
+        raise ValueError(msg)
+
+
+def _truncated_stack(reason: str) -> Stack:
+    """
+    Create a marker stack that takes the place of omitted exceptions.
+
+    *reason* is the name of the budget that was exhausted.
+    """
+    return Stack(exc_type="", exc_value="", truncated=reason)
 
 
 def safe_str(_object: Any) -> str:
@@ -191,7 +231,12 @@ def extract(
     locals_hide_dunder: bool = True,
     locals_hide_sunder: bool = False,
     use_rich: bool = True,
+    max_exceptions: int | None = None,
+    max_total_frames: int | None = None,
+    max_group_depth: int | None = None,
     _seen: set[int] | None = None,
+    _budget: _Budget | None = None,
+    _depth: int = 0,
 ) -> Trace:
     """
     Extract traceback information.
@@ -226,6 +271,26 @@ def extract(
             If ``False`` or if rich_ is not installed, fall back to a simpler
             algorithm.
 
+        max_exceptions:
+            Maximum number of exceptions (nodes) to extract across the whole
+            exception tree, including cause chains and exception groups.
+            ``None`` (the default) means no limit.  If the budget is
+            exhausted, remaining exceptions are replaced by a marker stack
+            whose *truncated* field is ``"max_exceptions"``.
+
+        max_total_frames:
+            Maximum total number of frames to extract across all stacks.
+            ``None`` (the default) means no limit.  Frames beyond the budget
+            are not inspected (their locals are not read) and are replaced by
+            a marker frame.
+
+        max_group_depth:
+            Maximum nesting depth up to which exception groups are expanded.
+            The root exception is at depth 0, so ``0`` means no group is
+            expanded at all.  ``None`` (the default) means no limit.
+            Unexpanded groups get a marker trace whose stack's *truncated*
+            field is ``"max_group_depth"``.
+
     Returns:
         A Trace instance with structured information about all exceptions.
 
@@ -240,6 +305,10 @@ def extract(
 
     .. versionchanged:: 25.5.0
        Handle loops in exception cause chain.
+
+    .. versionchanged:: 26.2.0
+       Added *max_exceptions*, *max_total_frames* and *max_group_depth*
+       arguments.
     """
 
     stacks: list[Stack] = []
@@ -248,11 +317,31 @@ def extract(
     if _seen is None:
         _seen = set()
 
+    if _budget is None:
+        _validate_budget("max_exceptions", max_exceptions)
+        _validate_budget("max_total_frames", max_total_frames)
+        _validate_budget("max_group_depth", max_group_depth)
+        _budget = _Budget(
+            exceptions_remaining=max_exceptions,
+            frames_remaining=max_total_frames,
+            max_group_depth=max_group_depth,
+        )
+
     while True:
         exc_id = id(exc_value)
         if exc_id in _seen:
             break
         _seen.add(exc_id)
+
+        if (
+            _budget.exceptions_remaining is not None
+            and _budget.exceptions_remaining <= 0
+        ):
+            stacks.append(_truncated_stack("max_exceptions"))
+            break
+
+        if _budget.exceptions_remaining is not None:
+            _budget.exceptions_remaining -= 1
 
         stack = Stack(
             exc_type=safe_str(exc_type.__name__),
@@ -266,21 +355,42 @@ def extract(
         if sys.version_info >= (3, 11):
             if isinstance(exc_value, (BaseExceptionGroup, ExceptionGroup)):  # noqa: F821
                 stack.is_group = True
-                for exception in exc_value.exceptions:
+                if (
+                    _budget.max_group_depth is not None
+                    and _depth >= _budget.max_group_depth
+                ):
                     stack.exceptions.append(
-                        extract(
-                            type(exception),
-                            exception,
-                            exception.__traceback__,
-                            show_locals=show_locals,
-                            locals_max_length=locals_max_length,
-                            locals_max_string=locals_max_string,
-                            locals_hide_dunder=locals_hide_dunder,
-                            locals_hide_sunder=locals_hide_sunder,
-                            use_rich=use_rich,
-                            _seen=_seen,
-                        )
+                        Trace(stacks=[_truncated_stack("max_group_depth")])
                     )
+                else:
+                    for exception in exc_value.exceptions:
+                        if (
+                            _budget.exceptions_remaining is not None
+                            and _budget.exceptions_remaining <= 0
+                        ):
+                            stack.exceptions.append(
+                                Trace(
+                                    stacks=[_truncated_stack("max_exceptions")]
+                                )
+                            )
+                            break
+
+                        stack.exceptions.append(
+                            extract(
+                                type(exception),
+                                exception,
+                                exception.__traceback__,
+                                show_locals=show_locals,
+                                locals_max_length=locals_max_length,
+                                locals_max_string=locals_max_string,
+                                locals_hide_dunder=locals_hide_dunder,
+                                locals_hide_sunder=locals_hide_sunder,
+                                use_rich=use_rich,
+                                _seen=_seen,
+                                _budget=_budget,
+                                _depth=_depth + 1,
+                            )
+                        )
 
         if isinstance(exc_value, SyntaxError):
             stack.syntax_error = SyntaxError_(
@@ -308,7 +418,20 @@ def extract(
                     continue
                 yield key, value
 
+        skipped_frames = 0
         for frame_summary, line_no in walk_tb(traceback):
+            if (
+                _budget.frames_remaining is not None
+                and _budget.frames_remaining <= 0
+            ):
+                # Over the total frame budget: count the remaining frames
+                # without touching their locals or calling repr().
+                skipped_frames += 1
+                continue
+
+            if _budget.frames_remaining is not None:
+                _budget.frames_remaining -= 1
+
             filename = frame_summary.f_code.co_filename
             if filename and not filename.startswith("<"):
                 filename = os.path.abspath(filename)
@@ -337,6 +460,17 @@ def extract(
                 ),
             )
             append(frame)
+
+        if skipped_frames:
+            append(
+                Frame(
+                    filename="",
+                    lineno=-1,
+                    name=(
+                        f"Skipped frames: {skipped_frames} (max_total_frames)"
+                    ),
+                )
+            )
 
         cause = getattr(exc_value, "__cause__", None)
         if cause and cause.__traceback__:
@@ -404,6 +538,25 @@ class ExceptionDictTransformer:
             the exception actually happened.  With larger web frameworks, this
             does not always work, so you should stick with the default.
 
+        max_exceptions:
+            Maximum number of exceptions (nodes) to extract across the whole
+            exception tree, shared by all cause chains and exception groups.
+            ``None`` (the default) means no limit.  Omitted exceptions are
+            replaced by a marker entry with ``"truncated": "max_exceptions"``.
+
+        max_total_frames:
+            Maximum total number of frames to extract across all stacks of
+            the whole exception tree.  ``None`` (the default) means no limit.
+            Frames beyond the budget are not inspected (their locals are not
+            read) and are replaced by a marker frame.
+
+        max_group_depth:
+            Maximum nesting depth up to which exception groups are expanded.
+            The root exception is at depth 0, so ``0`` means no group is
+            expanded at all.  ``None`` (the default) means no limit.
+            Unexpanded groups get a marker entry with ``"truncated":
+            "max_group_depth"``.
+
         use_rich: If ``True`` (the default), use rich_ to compute the repr of
             locals.  If ``False`` or if rich_ is not installed, fall back to
             a simpler algorithm.
@@ -422,6 +575,10 @@ class ExceptionDictTransformer:
 
     .. versionchanged:: 25.4.0
        Handle exception groups.
+
+    .. versionchanged:: 26.2.0
+       Added *max_exceptions*, *max_total_frames* and *max_group_depth*
+       arguments.
     """
 
     show_locals: bool
@@ -431,6 +588,9 @@ class ExceptionDictTransformer:
     locals_hide_sunder: bool
     suppress: Sequence[str]
     max_frames: int
+    max_exceptions: int | None
+    max_total_frames: int | None
+    max_group_depth: int | None
     use_rich: bool
 
     def __init__(
@@ -443,6 +603,9 @@ class ExceptionDictTransformer:
         locals_hide_sunder: bool = False,
         suppress: Iterable[str | ModuleType] = (),
         max_frames: int = MAX_FRAMES,
+        max_exceptions: int | None = None,
+        max_total_frames: int | None = None,
+        max_group_depth: int | None = None,
         use_rich: bool = True,
     ) -> None:
         if locals_max_length is not None and locals_max_length < 0:
@@ -454,6 +617,9 @@ class ExceptionDictTransformer:
         if max_frames < 2:
             msg = f'"max_frames" must be >= 2: {max_frames}'
             raise ValueError(msg)
+        _validate_budget("max_exceptions", max_exceptions)
+        _validate_budget("max_total_frames", max_total_frames)
+        _validate_budget("max_group_depth", max_group_depth)
         self.show_locals = show_locals
         self.locals_max_length = locals_max_length
         self.locals_max_string = locals_max_string
@@ -474,6 +640,9 @@ class ExceptionDictTransformer:
             path = os.path.normpath(os.path.abspath(path))
             self.suppress.append(path)
         self.max_frames = max_frames
+        self.max_exceptions = max_exceptions
+        self.max_total_frames = max_total_frames
+        self.max_group_depth = max_group_depth
         self.use_rich = use_rich
 
     def __call__(self, exc_info: ExcInfo) -> list[dict[str, Any]]:
@@ -485,6 +654,9 @@ class ExceptionDictTransformer:
             locals_hide_dunder=self.locals_hide_dunder,
             locals_hide_sunder=self.locals_hide_sunder,
             use_rich=self.use_rich,
+            max_exceptions=self.max_exceptions,
+            max_total_frames=self.max_total_frames,
+            max_group_depth=self.max_group_depth,
         )
 
         for stack in trace.stacks:
@@ -511,6 +683,8 @@ class ExceptionDictTransformer:
         stack_dicts = []
         for stack in trace.stacks:
             stack_dict = asdict(stack)
+            if stack.truncated is None:
+                del stack_dict["truncated"]
             for frame_dict in stack_dict["frames"]:
                 if frame_dict["locals"] is None or any(
                     frame_dict["filename"].startswith(path)

@@ -1202,3 +1202,430 @@ def test_exception_cycle():
         )
         == trace.stacks[0]
     )
+
+
+def _raised(exc: BaseException) -> BaseException:
+    """Raise *exc* and return it, so it has a traceback attached."""
+    try:
+        raise exc
+    except BaseException as e:
+        return e
+
+
+def _walk_stack_dicts(
+    stack_dicts: list[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    """Yield all stack dicts of a rendered exception tree, depth first."""
+    for stack_dict in stack_dicts:
+        yield stack_dict
+        for trace in stack_dict["exceptions"]:
+            yield from _walk_stack_dicts(trace)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"max_exceptions": -1}, ValueError),
+        ({"max_exceptions": True}, TypeError),
+        ({"max_exceptions": 1.5}, TypeError),
+        ({"max_exceptions": "3"}, TypeError),
+        ({"max_total_frames": -1}, ValueError),
+        ({"max_total_frames": False}, TypeError),
+        ({"max_total_frames": 2.0}, TypeError),
+        ({"max_group_depth": -2}, ValueError),
+        ({"max_group_depth": True}, TypeError),
+        ({"max_group_depth": "0"}, TypeError),
+    ],
+)
+def test_json_traceback_budget_validation(
+    kwargs: dict[str, Any], error: type[Exception]
+) -> None:
+    """
+    Negative, boolean and non-integer budgets are rejected with a clear
+    error naming the argument.
+    """
+    with pytest.raises(error, match=next(iter(kwargs.keys()))):
+        tracebacks.ExceptionDictTransformer(**kwargs)
+
+
+def test_extract_budget_validation() -> None:
+    """
+    extract() validates its budget arguments the same way as
+    ExceptionDictTransformer.
+    """
+    exc = ValueError("onoes")
+
+    with pytest.raises(TypeError, match="max_exceptions"):
+        tracebacks.extract(type(exc), exc, None, max_exceptions=True)
+
+    with pytest.raises(ValueError, match="max_total_frames"):
+        tracebacks.extract(type(exc), exc, None, max_total_frames=-1)
+
+
+def test_json_traceback_budgets_not_exceeded() -> None:
+    """
+    Configuring budgets that are not exceeded does not change the output,
+    and no "truncated" keys appear.
+    """
+    try:
+        1 / 0
+    except ZeroDivisionError as e:
+        exc_info = (type(e), e, e.__traceback__)
+
+    plain = tracebacks.ExceptionDictTransformer(show_locals=False)(exc_info)
+    budgeted = tracebacks.ExceptionDictTransformer(
+        show_locals=False,
+        max_exceptions=10,
+        max_total_frames=100,
+        max_group_depth=10,
+    )(exc_info)
+
+    assert plain == budgeted
+    assert all(
+        "truncated" not in stack_dict
+        for stack_dict in _walk_stack_dicts(budgeted)
+    )
+
+
+def test_json_traceback_zero_max_exceptions() -> None:
+    """
+    A zero exception budget is legal: every exception is replaced by a
+    single truncation marker and the result stays JSON-serializable.
+    """
+    exc = _raised(ValueError("onoes"))
+    result = tracebacks.ExceptionDictTransformer(max_exceptions=0)(
+        (type(exc), exc, exc.__traceback__)
+    )
+
+    assert 1 == len(result)
+    assert "max_exceptions" == result[0]["truncated"]
+    json.dumps(result)
+
+
+def test_json_traceback_zero_max_total_frames() -> None:
+    """
+    A zero total frame budget keeps the exceptions but replaces all frames
+    by a marker frame.
+    """
+    exc = _raised(ValueError("onoes"))
+    result = tracebacks.ExceptionDictTransformer(max_total_frames=0)(
+        (type(exc), exc, exc.__traceback__)
+    )
+
+    assert "ValueError" == result[0]["exc_type"]
+    assert "onoes" == result[0]["exc_value"]
+    assert 1 == len(result[0]["frames"])
+    marker = result[0]["frames"][0]
+    assert -1 == marker["lineno"]
+    assert marker["name"].startswith("Skipped frames: ")
+    assert "max_total_frames" in marker["name"]
+    json.dumps(result)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_zero_max_group_depth() -> None:
+    """
+    A zero group depth budget keeps the group itself but does not expand
+    its children.
+    """
+    group = _raised(
+        ExceptionGroup("group", [_raised(ValueError("leaf"))])  # noqa: F821
+    )
+    result = tracebacks.ExceptionDictTransformer(max_group_depth=0)(
+        (type(group), group, group.__traceback__)
+    )
+
+    assert "ExceptionGroup" == result[0]["exc_type"]  # noqa: F821
+    assert result[0]["is_group"]
+    assert 1 == len(result[0]["exceptions"])
+    assert "max_group_depth" == result[0]["exceptions"][0][0]["truncated"]
+    json.dumps(result)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_max_exceptions_wide_group() -> None:
+    """
+    The exception budget is shared by all children of a group: children
+    are kept in order until the budget is exhausted and the rest is
+    replaced by one marker.
+    """
+    children = [_raised(ValueError(f"error {i}")) for i in range(5)]
+    group = _raised(ExceptionGroup("wide", children))  # noqa: F821
+
+    result = tracebacks.ExceptionDictTransformer(max_exceptions=3)(
+        (type(group), group, group.__traceback__)
+    )
+
+    assert "ExceptionGroup" == result[0]["exc_type"]  # noqa: F821
+    traces = result[0]["exceptions"]
+    assert 3 == len(traces)
+    # The first two children are kept, in order, with their data intact.
+    assert "error 0" == traces[0][0]["exc_value"]
+    assert "error 1" == traces[1][0]["exc_value"]
+    assert "truncated" not in traces[0][0]
+    assert "truncated" not in traces[1][0]
+    # The remaining three children are replaced by one marker.
+    assert "max_exceptions" == traces[2][0]["truncated"]
+    json.dumps(result)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_max_exceptions_shared_cause() -> None:
+    """
+    A cause that is shared between several group children is extracted
+    only once (existing _seen handling) and therefore consumes the
+    exception budget only once.
+    """
+    shared = _raised(ValueError("shared cause"))
+    children = []
+    for i in range(3):
+        try:
+            raise RuntimeError(f"child {i}") from shared
+        except RuntimeError as child:
+            children.append(child)
+    group = _raised(ExceptionGroup("group", children))  # noqa: F821
+
+    # 1 group + 3 children + 1 shared cause = 5 nodes: no truncation.
+    result = tracebacks.ExceptionDictTransformer(max_exceptions=5)(
+        (type(group), group, group.__traceback__)
+    )
+
+    assert all(
+        "truncated" not in stack_dict
+        for stack_dict in _walk_stack_dicts(result)
+    )
+    traces = result[0]["exceptions"]
+    assert 3 == len(traces)
+    # The shared cause is only rendered below the first child.
+    assert ["RuntimeError", "ValueError"] == [
+        stack["exc_type"] for stack in traces[0]
+    ]
+    assert traces[0][1]["is_cause"]
+    assert "shared cause" == traces[0][1]["exc_value"]
+    assert 1 == len(traces[1])
+    assert 1 == len(traces[2])
+
+    # One node less and the last child is replaced by a marker.
+    result = tracebacks.ExceptionDictTransformer(max_exceptions=4)(
+        (type(group), group, group.__traceback__)
+    )
+    traces = result[0]["exceptions"]
+    assert "max_exceptions" == traces[2][0]["truncated"]
+    json.dumps(result)
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_max_group_depth() -> None:
+    """
+    Groups nested deeper than max_group_depth are kept as nodes (with
+    type, message and notes) but their children are not extracted; a
+    marker takes their place.
+    """
+    leaf = _raised(ValueError("leaf"))
+    inner = _raised(ExceptionGroup("inner", [leaf]))  # noqa: F821
+    inner.add_note("inner note")
+    outer = _raised(ExceptionGroup("outer", [inner]))  # noqa: F821
+
+    result = tracebacks.ExceptionDictTransformer(max_group_depth=1)(
+        (type(outer), outer, outer.__traceback__)
+    )
+
+    inner_dict = result[0]["exceptions"][0][0]
+    assert "ExceptionGroup" == inner_dict["exc_type"]  # noqa: F821
+    assert "inner (1 sub-exception)" == inner_dict["exc_value"]
+    assert ["inner note"] == inner_dict["exc_notes"]
+    assert inner_dict["is_group"]
+    assert not inner_dict["is_cause"]
+    # The inner group's children are not extracted.
+    assert 1 == len(inner_dict["exceptions"])
+    marker = inner_dict["exceptions"][0][0]
+    assert "max_group_depth" == marker["truncated"]
+    json.dumps(result)
+
+    # Without a depth budget, everything is expanded.
+    result = tracebacks.ExceptionDictTransformer()(
+        (type(outer), outer, outer.__traceback__)
+    )
+    leaf_dict = result[0]["exceptions"][0][0]["exceptions"][0][0]
+    assert "ValueError" == leaf_dict["exc_type"]
+    assert "leaf" == leaf_dict["exc_value"]
+
+
+class _CountingRepr:
+    """Counts how often its repr is taken."""
+
+    calls = 0
+
+    def __repr__(self) -> str:
+        type(self).calls += 1
+        return "CountingRepr()"
+
+
+def _raise_with_counting_locals() -> ValueError:
+    def level1() -> None:
+        local1 = _CountingRepr()
+        level2()
+        _ = local1
+
+    def level2() -> None:
+        local2 = _CountingRepr()
+        level3()
+        _ = local2
+
+    def level3() -> None:
+        local3 = _CountingRepr()
+        raise ValueError("deep")
+        _ = local3
+
+    try:
+        level1()
+    except ValueError as e:
+        return e
+
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+@pytest.mark.parametrize("use_rich", [False, True])
+def test_json_traceback_max_total_frames(use_rich: bool) -> None:
+    """
+    The total frame budget is shared by all stacks.  Frames beyond the
+    budget are not extracted: their locals are never repr'd.  A marker
+    frame with the number of skipped frames takes their place.
+    """
+    _CountingRepr.calls = 0
+    exc = _raise_with_counting_locals()
+
+    result = tracebacks.ExceptionDictTransformer(
+        show_locals=True,
+        max_total_frames=3,
+        use_rich=use_rich,
+    )((type(exc), exc, exc.__traceback__))
+
+    frames = result[0]["frames"]
+    # 3 real frames (test helper, level1, level2) + 1 marker for level3.
+    assert 4 == len(frames)
+    assert "level1" == frames[1]["name"]
+    assert "level2" == frames[2]["name"]
+    assert "CountingRepr()" == frames[1]["locals"]["local1"]
+    assert "CountingRepr()" == frames[2]["locals"]["local2"]
+    marker = frames[3]
+    assert -1 == marker["lineno"]
+    assert "Skipped frames: 1 (max_total_frames)" == marker["name"]
+    assert "locals" not in marker
+    # local3's repr was never taken because its frame was over budget.
+    assert 2 == _CountingRepr.calls
+    json.dumps(result)
+
+
+@pytest.mark.skipif(rich is None, reason="rich not installed")
+def test_json_traceback_max_total_frames_rich() -> None:
+    """
+    The frame budget behaves the same when rich renders the locals.
+    """
+    _CountingRepr.calls = 0
+    exc = _raise_with_counting_locals()
+
+    with patch.object(tracebacks, "rich", rich):
+        result = tracebacks.ExceptionDictTransformer(
+            show_locals=True,
+            max_total_frames=3,
+            use_rich=True,
+        )((type(exc), exc, exc.__traceback__))
+
+    marker = result[0]["frames"][3]
+    assert "Skipped frames: 1 (max_total_frames)" == marker["name"]
+    assert 2 == _CountingRepr.calls
+
+
+def test_json_traceback_max_total_frames_with_suppress() -> None:
+    """
+    suppress and the total frame budget compose: kept frames honor
+    suppress, the marker frame is unaffected.
+    """
+    exc = _raise_with_counting_locals()
+
+    result = tracebacks.ExceptionDictTransformer(
+        show_locals=True,
+        max_total_frames=3,
+        suppress=(str(Path(__file__).parent),),
+    )((type(exc), exc, exc.__traceback__))
+
+    frames = result[0]["frames"]
+    assert 4 == len(frames)
+    assert all("locals" not in frame for frame in frames)
+    assert "Skipped frames: 1 (max_total_frames)" == frames[3]["name"]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="Requires Python 3.11 or higher"
+)
+def test_json_traceback_combined_budgets() -> None:
+    """
+    All three budgets apply together, share one traversal and leave a
+    JSON-serializable result with markers at the truncation points.
+    """
+
+    def make_leaf(msg: str) -> BaseException:
+        return _raised(ValueError(msg))
+
+    inner_a = _raised(
+        ExceptionGroup("a", [make_leaf("a1"), make_leaf("a2")])  # noqa: F821
+    )
+    inner_b = _raised(
+        ExceptionGroup("b", [make_leaf("b1"), make_leaf("b2")])  # noqa: F821
+    )
+    outer = _raised(ExceptionGroup("outer", [inner_a, inner_b]))  # noqa: F821
+
+    result = tracebacks.ExceptionDictTransformer(
+        show_locals=True,
+        max_exceptions=5,
+        max_total_frames=4,
+        max_group_depth=2,
+    )((type(outer), outer, outer.__traceback__))
+
+    # JSON-serializable as promised.
+    json.dumps(result)
+
+    stacks = list(_walk_stack_dicts(result))
+    kept = [s for s in stacks if "truncated" not in s]
+    markers = [s for s in stacks if "truncated" in s]
+
+    # The node budget is exact and shared: outer, a, a1, a2, b are kept
+    # (depth-first, in order); b's children are replaced by a marker.
+    assert 5 == len(kept)
+    assert [
+        "ExceptionGroup",
+        "ExceptionGroup",
+        "ValueError",
+        "ValueError",
+        "ExceptionGroup",
+    ] == [
+        s["exc_type"] for s in kept
+    ]
+    assert ["max_exceptions"] == [m["truncated"] for m in markers]
+
+    # The frame budget is shared across stacks: at most 4 real frames.
+    real_frames = [
+        frame
+        for stack in kept
+        for frame in stack["frames"]
+        if frame["lineno"] != -1
+    ]
+    assert 4 == len(real_frames)
+    # Truncated stacks carry a marker frame instead.
+    skipped = [
+        frame
+        for stack in kept
+        for frame in stack["frames"]
+        if frame["lineno"] == -1
+    ]
+    assert skipped
+    assert all("max_total_frames" in frame["name"] for frame in skipped)
